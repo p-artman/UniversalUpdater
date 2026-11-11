@@ -36,6 +36,7 @@ using System.Collections.Generic;
 using System.Diagnostics;
 using System.IO;
 using System.Management;
+using System.Text;
 using System.Threading.Tasks;
 
 namespace Universal_Updater
@@ -43,31 +44,84 @@ namespace Universal_Updater
     class PushPackages
     {
         public static Process updateProcess;
+        public static int lastIutoolExitCode = -1;
         public static int suggestedTimeOut = 6000;
         public static bool useOldTools = false;
+        private static readonly object outputLock = new object();
+
         public static async Task StartUpdate()
         {
             stopRunningApps("iutool.exe");
+            lastIutoolExitCode = -1;
 
             var packagesPath = Program.filteredDirectory + $@"\{GetDeviceInfo.SerialNumber[0]}\Packages";
-            int timeout = calculateTimeout(packagesPath);
+            calculateTimeout(packagesPath);
 
-            updateProcess = new Process();
-            // We use our wrapper to handle logs
-            // this is prepared at iutool.bat but not implemented to write logs to file yet
-            // generally update issues depends on getdulogs rather than this
-            var iutoolPath = Program.toolsDirectory + $@"\i386\iutool.exe";
-            updateProcess.StartInfo.FileName = Program.toolsDirectory + $@"\iutool.bat";
-            updateProcess.StartInfo.Arguments = $"\"{iutoolPath}\" \"{packagesPath}\" \"{Program.logFile}\"";
+            var iutoolPath = Path.Combine(Environment.CurrentDirectory, Program.toolsDirectory, "i386", "iutool.exe");
+            var arguments = $"-V -p \"{packagesPath}\"";
+            Program.appendLog($"\n[COMMAND]: {iutoolPath} {arguments}\n");
+            Program.WriteLine("\n[OUTPUT] (iutool.exe)\nSending packages to device, please wait...\n", ConsoleColor.DarkYellow);
+            Program.showTitleWaitMessage(true, "iutool.exe");
 
-            // This tool is hard to handle it's output,
-            // better to show the window
-            updateProcess.StartInfo.UseShellExecute = true;
-            updateProcess.StartInfo.CreateNoWindow = false;
+            try
+            {
+                using (var process = new Process())
+                {
+                    process.StartInfo.FileName = iutoolPath;
+                    process.StartInfo.Arguments = arguments;
+                    process.StartInfo.UseShellExecute = false;
+                    process.StartInfo.CreateNoWindow = true;
+                    process.StartInfo.RedirectStandardOutput = true;
+                    process.StartInfo.RedirectStandardError = true;
+                    process.StartInfo.RedirectStandardInput = true;
 
-            Program.WriteLine("\n[OUTPUT] (iutool.exe)\nPlease check iutool window.", ConsoleColor.DarkYellow);
-            updateProcess.Start();
-            updateProcess.WaitForExit(timeout);
+                    updateProcess = process;
+                    var outputBuilder = new StringBuilder();
+
+                    process.OutputDataReceived += (sender, e) =>
+                    {
+                        if (!string.IsNullOrEmpty(e.Data))
+                        {
+                            lock (outputLock)
+                            {
+                                outputBuilder.AppendLine(e.Data);
+                                Program.resetCursorPosition();
+                                Program.WriteLine(e.Data, ConsoleColor.DarkGray, true);
+                            }
+                        }
+                    };
+                    process.ErrorDataReceived += (sender, e) =>
+                    {
+                        if (!string.IsNullOrEmpty(e.Data))
+                        {
+                            lock (outputLock)
+                            {
+                                outputBuilder.AppendLine(e.Data);
+                                Program.resetCursorPosition();
+                                Program.WriteLine(e.Data, ConsoleColor.Red, true);
+                            }
+                        }
+                    };
+
+                    process.Start();
+                    process.BeginOutputReadLine();
+                    process.BeginErrorReadLine();
+                    await Task.Run(() => process.WaitForExit());
+                    lastIutoolExitCode = process.ExitCode;
+                    Program.appendLog($"[iutool.exe] ExitCode: 0x{lastIutoolExitCode:X} ({lastIutoolExitCode})\n");
+                }
+            }
+            catch (Exception ex)
+            {
+                Program.WriteLine($"Failed to run iutool.exe: {ex.Message}", ConsoleColor.Red);
+                Program.appendLog($"[iutool.exe] Exception: {ex}\n");
+                lastIutoolExitCode = -1;
+            }
+            finally
+            {
+                updateProcess = null;
+                Program.showTitleWaitMessage(false);
+            }
         }
 
         public static async Task PushToFFU(FFUEntry FFUMountData)
@@ -212,22 +266,30 @@ namespace Universal_Updater
 
         public static void stopRunningApps(string appName)
         {
-            var appFullPath = $@"{Environment.CurrentDirectory}\{Program.toolsDirectory}\i386\{appName}";
+            var appFullPath = Path.GetFullPath(Path.Combine(Environment.CurrentDirectory, Program.toolsDirectory, "i386", appName));
             string processName = Path.GetFileNameWithoutExtension(appName);
 
             Process[] existingProcesses = Process.GetProcessesByName(processName);
 
             foreach (Process proc in existingProcesses)
             {
-                string fullPath = proc.MainModule.FileName;
-
-                if (fullPath == appFullPath)
+                using (proc)
                 {
-                    Program.WriteLine($"Tool ({appName}) detected in use, force closing..", ConsoleColor.Red);
-                    proc.Kill();
-                    proc.WaitForExit();
-                    Program.WriteLine($"Tool ({appName}) closed.", ConsoleColor.DarkYellow);
-
+                    try
+                    {
+                        string fullPath = Path.GetFullPath(proc.MainModule.FileName);
+                        if (string.Equals(fullPath, appFullPath, StringComparison.OrdinalIgnoreCase))
+                        {
+                            Program.WriteLine($"Tool ({appName}) detected in use, force closing..", ConsoleColor.Red);
+                            proc.Kill();
+                            proc.WaitForExit();
+                            Program.WriteLine($"Tool ({appName}) closed.", ConsoleColor.DarkYellow);
+                        }
+                    }
+                    catch (Exception ex)
+                    {
+                        Program.appendLog($"[stopRunningApps] Skipped process inspection for {appName}: {ex.Message}\n");
+                    }
                 }
             }
         }
@@ -280,24 +342,91 @@ namespace Universal_Updater
             return null;
         }
 
+        public static async Task CleanupStaleWimMounts()
+        {
+            try
+            {
+                var dismPath = Path.Combine(
+                    Environment.GetFolderPath(Environment.SpecialFolder.Windows),
+                    Environment.Is64BitOperatingSystem && !Environment.Is64BitProcess
+                        ? @"Sysnative\dism.exe"
+                        : @"System32\dism.exe");
+
+                if (!File.Exists(dismPath))
+                {
+                    return;
+                }
+
+                Program.appendLog($"[CLEANUP] Running: {dismPath} /Cleanup-Wim\n");
+                using (var proc = new Process())
+                {
+                    proc.StartInfo.FileName = dismPath;
+                    proc.StartInfo.Arguments = "/Cleanup-Wim";
+                    proc.StartInfo.UseShellExecute = false;
+                    proc.StartInfo.CreateNoWindow = true;
+                    proc.StartInfo.RedirectStandardOutput = true;
+                    proc.StartInfo.RedirectStandardError = true;
+                    proc.Start();
+
+                    var outTask = proc.StandardOutput.ReadToEndAsync();
+                    var errTask = proc.StandardError.ReadToEndAsync();
+                    await Task.Run(() =>
+                    {
+                        if (!proc.WaitForExit(30000))
+                        {
+                            try { proc.Kill(); } catch { }
+                        }
+                    });
+                    string stdOut = string.Empty;
+                    string stdErr = string.Empty;
+                    try { stdOut = await outTask; } catch { }
+                    try { stdErr = await errTask; } catch { }
+                    if (!string.IsNullOrWhiteSpace(stdOut))
+                        Program.appendLog(stdOut.TrimEnd() + "\n");
+                    if (!string.IsNullOrWhiteSpace(stdErr))
+                        Program.appendLog(stdErr.TrimEnd() + "\n");
+                    Program.appendLog($"[CLEANUP] DISM ExitCode: {proc.ExitCode}\n");
+                }
+            }
+            catch (Exception ex)
+            {
+                Program.appendLog($"[CLEANUP] DISM /Cleanup-Wim error: {ex.Message}\n");
+            }
+        }
+
         public static async Task safeMountCheck()
         {
             var mountedDriveCachedData = Program.toolsDirectory + @"\mounted.ffu.json";
             if (File.Exists(mountedDriveCachedData))
             {
-                var data = File.ReadAllText(mountedDriveCachedData);
-                FFUEntry entry = JsonConvert.DeserializeObject<FFUEntry>(data);
-
-                if (Directory.Exists(entry.MountPath) && IsDriveMounted(entry.DriveIdentifier))
+                try
                 {
-                    // User closed the app without dismounting the FFU
-                    // this can lead to issues and we should dismount first
-                    Program.WriteLine($"Mounted FFU detected! at {entry.DriveIdentifier}", ConsoleColor.Red);
-                    Program.WriteLine($"This can lead to issues, dismounting {entry.DriveIdentifier}..", ConsoleColor.Red);
-                    await Task.Delay(1000);
-                    await dismountFFU(entry, null);
+                    var data = File.ReadAllText(mountedDriveCachedData);
+                    FFUEntry entry = JsonConvert.DeserializeObject<FFUEntry>(data);
+
+                    if (entry != null && !string.IsNullOrEmpty(entry.DriveIdentifier) &&
+                        ((!string.IsNullOrEmpty(entry.MountPath) && Directory.Exists(entry.MountPath)) || IsDriveMounted(entry.DriveIdentifier)))
+                    {
+                        // User closed the app without dismounting the FFU
+                        // this can lead to issues and we should dismount first
+                        Program.WriteLine($"Mounted FFU detected! at {entry.DriveIdentifier}", ConsoleColor.Red);
+                        Program.WriteLine($"This can lead to issues, dismounting {entry.DriveIdentifier}..", ConsoleColor.Red);
+                        await Task.Delay(1000);
+                        await dismountFFU(entry, null);
+                    }
                 }
-                File.Delete(mountedDriveCachedData);
+                catch (Exception ex)
+                {
+                    Program.appendLog($"[safeMountCheck] {ex.Message}\n");
+                }
+                try
+                {
+                    if (File.Exists(mountedDriveCachedData))
+                    {
+                        File.Delete(mountedDriveCachedData);
+                    }
+                }
+                catch { }
             }
         }
 
@@ -343,6 +472,15 @@ namespace Universal_Updater
             if (!FFUMountData.TempMount)
             {
                 Program.WriteLine("FFU dismounted successfully", ConsoleColor.Green);
+                var mountedDriveCachedData = Program.toolsDirectory + @"\mounted.ffu.json";
+                try
+                {
+                    if (File.Exists(mountedDriveCachedData))
+                    {
+                        File.Delete(mountedDriveCachedData);
+                    }
+                }
+                catch { }
             }
             else
             {
@@ -544,62 +682,69 @@ namespace Universal_Updater
         {
             Program.showTitleWaitMessage(true, batfile);
             var mountedPath = FFUMountData.MountPath.TrimEnd('\\');
-            var batProcess = new Process();
-
-            // We have to do it this way if process is x86 running on x64 host
-            var cmdFullFileName = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.Windows),
-                                      Environment.Is64BitOperatingSystem && !Environment.Is64BitProcess
-                                          ? @"Sysnative\cmd.exe"
-                                          : @"System32\cmd.exe");
-
-            var targetBat = $@"{Environment.CurrentDirectory}\{Program.toolsDirectory}\{batfile}";
-            string args = $"/c \"\"{targetBat}\" \"{mountedPath}\" \"{Program.logFile}\"\"";
-            Program.appendLog($"[CMD DETAILS]\nIf you see Sysnative in the path this fine and expected\n");
-            Program.appendLog($"CMD PATH: {cmdFullFileName}\n");
-            Program.appendLog($"CMD ARGS: {args}\n");
-            batProcess.StartInfo.FileName = cmdFullFileName;
-            batProcess.StartInfo.Arguments = args;
-            batProcess.StartInfo.RedirectStandardInput = true;
-            batProcess.StartInfo.RedirectStandardOutput = true;
-            batProcess.StartInfo.RedirectStandardError = true;
-            batProcess.StartInfo.UseShellExecute = false;
-            batProcess.StartInfo.CreateNoWindow = true;
-
-            string output = "";
-            bool hasError = false;
-            Program.WriteLine($"[{batfile}]\n", ConsoleColor.DarkYellow);
-            batProcess.OutputDataReceived += (sender, e) =>
+            using (var batProcess = new Process())
             {
-                if (!string.IsNullOrEmpty(e.Data))
+                // We have to do it this way if process is x86 running on x64 host
+                var cmdFullFileName = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.Windows),
+                                          Environment.Is64BitOperatingSystem && !Environment.Is64BitProcess
+                                              ? @"Sysnative\cmd.exe"
+                                              : @"System32\cmd.exe");
+
+                var targetBat = $@"{Environment.CurrentDirectory}\{Program.toolsDirectory}\{batfile}";
+                string args = $"/c \"\"{targetBat}\" \"{mountedPath}\" \"{Program.logFile}\"\"";
+                Program.appendLog($"[CMD DETAILS]\nIf you see Sysnative in the path this fine and expected\n");
+                Program.appendLog($"CMD PATH: {cmdFullFileName}\n");
+                Program.appendLog($"CMD ARGS: {args}\n");
+                batProcess.StartInfo.FileName = cmdFullFileName;
+                batProcess.StartInfo.Arguments = args;
+                batProcess.StartInfo.RedirectStandardInput = true;
+                batProcess.StartInfo.RedirectStandardOutput = true;
+                batProcess.StartInfo.RedirectStandardError = true;
+                batProcess.StartInfo.UseShellExecute = false;
+                batProcess.StartInfo.CreateNoWindow = true;
+
+                var outputBuilder = new StringBuilder();
+                bool hasError = false;
+                Program.WriteLine($"[{batfile}]\n", ConsoleColor.DarkYellow);
+                batProcess.OutputDataReceived += (sender, e) =>
                 {
-                    Program.resetCursorPosition();
-                    Program.WriteLine($"{e.Data}", ConsoleColor.DarkGray, true);
-                    output += $"{e.Data}\n";
-                }
-            };
-            batProcess.ErrorDataReceived += (sender, e) =>
-            {
-                if (!string.IsNullOrEmpty(e.Data))
+                    if (!string.IsNullOrEmpty(e.Data))
+                    {
+                        lock (outputLock)
+                        {
+                            Program.resetCursorPosition();
+                            Program.WriteLine($"{e.Data}", ConsoleColor.DarkGray, true);
+                            outputBuilder.AppendLine(e.Data);
+                        }
+                    }
+                };
+                batProcess.ErrorDataReceived += (sender, e) =>
                 {
-                    Program.resetCursorPosition();
-                    Program.WriteLine($"{e.Data}", ConsoleColor.Red, true);
-                    output += $"{e.Data}\n";
+                    if (!string.IsNullOrEmpty(e.Data))
+                    {
+                        lock (outputLock)
+                        {
+                            Program.resetCursorPosition();
+                            Program.WriteLine($"{e.Data}", ConsoleColor.Red, true);
+                            outputBuilder.AppendLine(e.Data);
+                            hasError = true;
+                        }
+                    }
+                };
+
+                batProcess.Start();
+                batProcess.BeginOutputReadLine();
+                batProcess.BeginErrorReadLine();
+                await Task.Run(() => batProcess.WaitForExit());
+                if (batProcess.ExitCode != 0)
+                {
+                    Program.WriteLine($"Process '{batfile}' has errors, check the log.", ConsoleColor.Red);
                     hasError = true;
                 }
-            };
 
-            batProcess.Start();
-            batProcess.BeginOutputReadLine();
-            batProcess.BeginErrorReadLine();
-            batProcess.WaitForExit();
-            if (batProcess.ExitCode != 0)
-            {
-                Program.WriteLine($"Process '{batfile}' has errors, check the log.", ConsoleColor.Red);
-                hasError = true;
+                Program.showTitleWaitMessage(false);
+                return !hasError || ignoreErrors ? outputBuilder.ToString() : null;
             }
-
-            Program.showTitleWaitMessage(false);
-            return !hasError || ignoreErrors ? output : null;
         }
 
         public static bool showRetryQuestion(string message, string exitText = "Exit", ConsoleColor color = ConsoleColor.DarkYellow)
@@ -688,15 +833,18 @@ namespace Universal_Updater
                 process.StartInfo.UseShellExecute = false;
                 process.StartInfo.CreateNoWindow = true;
 
-                string output = "";
+                var outputBuilder = new StringBuilder();
                 Program.WriteLine($"[{fileName}]\n", ConsoleColor.DarkYellow);
                 process.OutputDataReceived += (sender, e) =>
                 {
                     if (!string.IsNullOrEmpty(e.Data))
                     {
-                        output += $"{e.Data}\n";
-                        Program.resetCursorPosition();
-                        Program.WriteLine($"{e.Data}", ConsoleColor.DarkGray, true);
+                        lock (outputLock)
+                        {
+                            outputBuilder.AppendLine(e.Data);
+                            Program.resetCursorPosition();
+                            Program.WriteLine($"{e.Data}", ConsoleColor.DarkGray, true);
+                        }
                     }
                 };
 
@@ -705,18 +853,21 @@ namespace Universal_Updater
                 {
                     if (!string.IsNullOrEmpty(e.Data))
                     {
-                        output += $"{e.Data}\n";
-                        Program.resetCursorPosition();
-                        Program.WriteLine($"{e.Data}", ConsoleColor.Red, true);
-                        hasError = true;
+                        lock (outputLock)
+                        {
+                            outputBuilder.AppendLine(e.Data);
+                            Program.resetCursorPosition();
+                            Program.WriteLine($"{e.Data}", ConsoleColor.Red, true);
+                            hasError = true;
+                        }
                     }
                 };
                 process.Start();
                 process.BeginOutputReadLine();
                 process.BeginErrorReadLine();
-                process.WaitForExit();
+                await Task.Run(() => process.WaitForExit());
 
-                await Task.Delay(500);
+                string output = outputBuilder.ToString();
 
                 if (process.ExitCode != 0)
                 {
@@ -827,9 +978,10 @@ namespace Universal_Updater
             }
 
             startIndex += searchPattern.Length;
-            int endIndex = output.IndexOf(Environment.NewLine, startIndex);
+            int endIndex = output.IndexOfAny(new[] { '\r', '\n' }, startIndex);
+            string val = endIndex < 0 ? output.Substring(startIndex) : output.Substring(startIndex, endIndex - startIndex);
 
-            return output.Substring(startIndex, endIndex - startIndex).Trim();
+            return val.Trim();
         }
         public static string ExtractTempMountPath(string output)
         {
@@ -847,9 +999,10 @@ namespace Universal_Updater
             }
 
             startIndex += searchPattern.Length;
-            int endIndex = output.IndexOf(Environment.NewLine, startIndex);
+            int endIndex = output.IndexOfAny(new[] { '\r', '\n' }, startIndex);
+            string val = endIndex < 0 ? output.Substring(startIndex) : output.Substring(startIndex, endIndex - startIndex);
 
-            return output.Substring(startIndex, endIndex - startIndex).Trim();
+            return val.Trim();
         }
 
         public static bool IsDriveMounted(string physicalDrive)
