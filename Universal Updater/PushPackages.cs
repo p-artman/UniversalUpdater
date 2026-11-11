@@ -35,6 +35,7 @@ using System;
 using System.Collections.Generic;
 using System.Diagnostics;
 using System.IO;
+using System.IO.Compression;
 using System.Management;
 using System.Text;
 using System.Threading.Tasks;
@@ -132,7 +133,23 @@ namespace Universal_Updater
             if (!string.IsNullOrEmpty(Program.FFUPath))
             {
                 {
-                    var pushState = await pushToFFU(packagesPath);
+                    Program.WriteLine("Preparing mounted FFU registry files...", ConsoleColor.Blue);
+                    if (!DecompressMountedFfuRegistryFiles(FFUMountData))
+                    {
+                        await dismountFFUQuestion(FFUMountData);
+                        Program.WriteLine("Preparing mounted FFU registry files failed!", ConsoleColor.Red);
+                        return;
+                    }
+
+                    Program.WriteLine("Checking staged packages for Paper SPKG format...", ConsoleColor.Blue);
+                    if (!PaperSpkgConverter.ConvertPaperSpkgsInDirectory(packagesPath))
+                    {
+                        await dismountFFUQuestion(FFUMountData);
+                        Program.WriteLine("Preparing Paper SPKG packages for CBS install failed!", ConsoleColor.Red);
+                        return;
+                    }
+
+                    var pushState = await pushToFFU(packagesPath, FFUMountData);
                     if (!pushState)
                     {
                         await dismountFFUQuestion(FFUMountData);
@@ -495,7 +512,125 @@ namespace Universal_Updater
             return true;
         }
 
-        public static async Task<bool> pushToFFU(string packagePath)
+        public static bool DecompressMountedFfuRegistryFiles(FFUEntry ffuMountData)
+        {
+            if (ffuMountData == null || string.IsNullOrWhiteSpace(ffuMountData.MountPath))
+            {
+                return true;
+            }
+
+            string mountRoot = ffuMountData.MountPath.TrimEnd('\\', '/');
+            if (!Directory.Exists(mountRoot))
+            {
+                Program.appendLog($"[FFU PREP] Mount path not found: {mountRoot}\n");
+                return false;
+            }
+
+            string[] candidateRelativeDirs = new[]
+            {
+                @"Windows\Packages\RegistryFiles",
+                @"EFIESP\Windows\Packages\RegistryFiles",
+                @"Data\Windows\Packages\RegistryFiles",
+                @"Windows\ImageUpdate\RegistryFiles"
+            };
+
+            int scannedFiles = 0;
+            int decompressedFiles = 0;
+
+            try
+            {
+                foreach (string relDir in candidateRelativeDirs)
+                {
+                    string fullDir = Path.Combine(mountRoot, relDir);
+                    if (!Directory.Exists(fullDir))
+                    {
+                        continue;
+                    }
+
+                    foreach (string filePath in Directory.GetFiles(fullDir, "*", SearchOption.AllDirectories))
+                    {
+                        scannedFiles++;
+                        if (!IsGzipFile(filePath))
+                        {
+                            continue;
+                        }
+
+                        byte[] decompressedBytes;
+                        using (var fs = File.OpenRead(filePath))
+                        using (var gz = new GZipStream(fs, CompressionMode.Decompress))
+                        using (var ms = new MemoryStream())
+                        {
+                            gz.CopyTo(ms);
+                            decompressedBytes = ms.ToArray();
+                        }
+
+                        if (decompressedBytes.Length == 0)
+                        {
+                            Program.appendLog($"[FFU PREP] Decompressed registry file is empty: {filePath}\n");
+                            return false;
+                        }
+
+                        var attrs = File.GetAttributes(filePath);
+                        if ((attrs & FileAttributes.ReadOnly) != 0)
+                        {
+                            File.SetAttributes(filePath, attrs & ~FileAttributes.ReadOnly);
+                        }
+
+                        string tempOut = filePath + ".ungz.tmp";
+                        try
+                        {
+                            File.WriteAllBytes(tempOut, decompressedBytes);
+                            File.Delete(filePath);
+                            File.Move(tempOut, filePath);
+                        }
+                        finally
+                        {
+                            if (File.Exists(tempOut) && File.Exists(filePath))
+                            {
+                                try { File.Delete(tempOut); } catch { }
+                            }
+                        }
+
+                        if (IsGzipFile(filePath))
+                        {
+                            Program.appendLog($"[FFU PREP] Registry file remained GZIP-compressed after write: {filePath}\n");
+                            return false;
+                        }
+
+                        decompressedFiles++;
+                    }
+                }
+
+                if (decompressedFiles > 0)
+                {
+                    Program.WriteLine($"Decompressed {decompressedFiles} GZIP registry file(s) in mounted FFU.", ConsoleColor.Green);
+                }
+                Program.appendLog($"[FFU PREP] Scanned {scannedFiles} registry file(s), decompressed {decompressedFiles} GZIP file(s).\n");
+                return true;
+            }
+            catch (Exception ex)
+            {
+                Program.appendLog($"[FFU PREP] Exception decompressing FFU registry files: {ex}\n");
+                Program.WriteLine($"Failed decompressing mounted FFU registry files: {ex.Message}", ConsoleColor.Red);
+                return false;
+            }
+        }
+
+        private static bool IsGzipFile(string filePath)
+        {
+            using (var fs = File.OpenRead(filePath))
+            {
+                if (fs.Length < 2)
+                {
+                    return false;
+                }
+                int b0 = fs.ReadByte();
+                int b1 = fs.ReadByte();
+                return b0 == 0x1F && b1 == 0x8B;
+            }
+        }
+
+        public static async Task<bool> pushToFFU(string packagePath, FFUEntry ffuMountData = null)
         {
             try
             {
@@ -550,6 +685,12 @@ namespace Universal_Updater
                 }
 
             installArea:
+                if (useOldTools && ffuMountData != null && !DecompressMountedFfuRegistryFiles(ffuMountData))
+                {
+                    userExitTheProcess = true;
+                    goto exitProcessArea;
+                }
+
                 Program.WriteLine("Installing Packages...", ConsoleColor.Blue);
                 var install = await RunProcessWithLog("updateapp.exe", $"install \"{packagePath}\"");
                 if (install == null)
@@ -868,6 +1009,7 @@ namespace Universal_Updater
                 await Task.Run(() => process.WaitForExit());
 
                 string output = outputBuilder.ToString();
+                bool hasFatalOutput = HasFatalOutputFailure(output);
 
                 if (process.ExitCode != 0)
                 {
@@ -882,7 +1024,7 @@ namespace Universal_Updater
                 }
 
                 // Exclude expected errors
-                if (hasError)
+                if (hasError || hasFatalOutput)
                 {
                     bool errorIsExpected = isErrorExpected(output, fileName, arguments);
                     if (!errorIsExpected)
@@ -896,6 +1038,33 @@ namespace Universal_Updater
                 Program.showTitleWaitMessage(false);
                 return output;
             }
+        }
+
+        private static bool HasFatalOutputFailure(string output)
+        {
+            if (string.IsNullOrEmpty(output))
+            {
+                return false;
+            }
+
+            string[] fatalMarkers = new[]
+            {
+                "install completed unsuccessfully",
+                "Update completed unsuccessfully",
+                "Staging completed unsuccessfully",
+                "converttocbs completed unsuccessfully",
+                "iutocbsfromupdateoutput completed unsuccessfully",
+                "Commit failed"
+            };
+
+            foreach (string marker in fatalMarkers)
+            {
+                if (output.IndexOf(marker, StringComparison.OrdinalIgnoreCase) >= 0)
+                {
+                    return true;
+                }
+            }
+            return false;
         }
 
         static Dictionary<string, List<ErrorEntry>> expectedErrorsMap = new Dictionary<string, List<ErrorEntry>>();
