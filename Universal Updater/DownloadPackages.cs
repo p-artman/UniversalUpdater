@@ -881,7 +881,7 @@ namespace Universal_Updater
                 if (packagesAction.KeyChar == '1')
                 {
                     Program.WriteLine("\n[PREPARING]\nPlease wait...", ConsoleColor.DarkYellow);
-                    var destDir = Path.Combine(Program.filteredDirectory, GetDeviceInfo.SerialNumber[0], "Packages");
+                    var destDir = GetDefaultPackagesDir();
                     Directory.CreateDirectory(destDir);
                     var validPackages = filteredPackages.Where(j => !string.IsNullOrWhiteSpace(j)).ToList();
                     for (int i = 0; i < validPackages.Count; i++)
@@ -987,6 +987,72 @@ namespace Universal_Updater
             return -1;
         }
 
+        internal static string GetDefaultPackagesDir()
+        {
+            string serialKey = (GetDeviceInfo.SerialNumber != null && GetDeviceInfo.SerialNumber.Length > 0 && !string.IsNullOrWhiteSpace(GetDeviceInfo.SerialNumber[0]))
+                ? GetDeviceInfo.SerialNumber[0]
+                : "Downloads";
+            return Path.Combine(Program.filteredDirectory, serialKey, "Packages");
+        }
+
+        internal static int ExportPackagesToFolder(string sourcePackagesDir, string destinationFolder, IEnumerable<string> explicitPackageFiles = null)
+        {
+            if (string.IsNullOrWhiteSpace(destinationFolder))
+            {
+                return 0;
+            }
+
+            var sourceFiles = new List<string>();
+            if (explicitPackageFiles != null)
+            {
+                foreach (var entry in explicitPackageFiles)
+                {
+                    if (!string.IsNullOrWhiteSpace(entry) && File.Exists(entry))
+                    {
+                        sourceFiles.Add(entry);
+                    }
+                }
+            }
+            else if (!string.IsNullOrWhiteSpace(sourcePackagesDir) && Directory.Exists(sourcePackagesDir))
+            {
+                foreach (var file in Directory.GetFiles(sourcePackagesDir, "*", SearchOption.TopDirectoryOnly))
+                {
+                    if (TryParsePackageFile(file, out _, out _, out _))
+                    {
+                        sourceFiles.Add(file);
+                    }
+                }
+            }
+
+            if (sourceFiles.Count == 0)
+            {
+                return 0;
+            }
+
+            string destFullDir = Path.GetFullPath(destinationFolder.Trim());
+            Directory.CreateDirectory(destFullDir);
+
+            int exportedCount = 0;
+            for (int i = 0; i < sourceFiles.Count; i++)
+            {
+                string srcPath = Path.GetFullPath(sourceFiles[i]);
+                string fileName = Path.GetFileName(srcPath);
+                string dstPath = Path.Combine(destFullDir, fileName);
+
+                Program.resetCursorPosition();
+                Program.WriteLine($@"[{i + 1}/{sourceFiles.Count}] {fileName}", ConsoleColor.DarkGray, true);
+
+                if (!string.Equals(srcPath, dstPath, StringComparison.OrdinalIgnoreCase))
+                {
+                    File.Copy(srcPath, dstPath, true);
+                }
+                exportedCount++;
+            }
+
+            Program.appendLog($"[EXPORT PACKAGES] Saved {exportedCount} package(s) to {destFullDir}\n");
+            return exportedCount;
+        }
+
         public static async Task<bool> DownloadUpdate(string update, string customDestinationFolder = null)
         {
             var validPackages = filteredPackages
@@ -1003,10 +1069,7 @@ namespace Universal_Updater
             string destinationDir = customDestinationFolder;
             if (string.IsNullOrWhiteSpace(destinationDir))
             {
-                string serialKey = (GetDeviceInfo.SerialNumber != null && GetDeviceInfo.SerialNumber.Length > 0 && !string.IsNullOrWhiteSpace(GetDeviceInfo.SerialNumber[0]))
-                    ? GetDeviceInfo.SerialNumber[0]
-                    : "Downloads";
-                destinationDir = Path.Combine(Program.filteredDirectory, serialKey, "Packages");
+                destinationDir = GetDefaultPackagesDir();
             }
             string cacheDir = Path.Combine(Environment.CurrentDirectory, "Cache", update);
             Directory.CreateDirectory(destinationDir);

@@ -453,6 +453,67 @@ namespace Universal_Updater
             }
         }
 
+        static async Task PromptExportDownloadedPackagesAsync(string sourcePackagesDir)
+        {
+            if (string.IsNullOrWhiteSpace(sourcePackagesDir) || !Directory.Exists(sourcePackagesDir))
+                return;
+
+            WriteLine("\n[EXPORT PACKAGES]", ConsoleColor.DarkGray);
+            WriteLine("Save downloaded CAB packages to a separate folder?", ConsoleColor.DarkYellow);
+            WriteLine("1. Yes", ConsoleColor.Green);
+            WriteLine("2. No (continue)", ConsoleColor.Gray);
+            Write("Choice: ", ConsoleColor.Magenta);
+
+            ConsoleKeyInfo exportChoice;
+            do
+            {
+                exportChoice = Console.ReadKey(true);
+            }
+            while (!IsNumberKeyOrNumpad(exportChoice, new char[] { '1', '2' }));
+            char exportDigit = NormalizeNumberKey(exportChoice);
+            Write(exportDigit + "\n");
+
+            if (exportDigit != '1')
+                return;
+
+            while (true)
+            {
+                string exportFolder = await GeneralPicker.ShowSelectFolderDialogAsync("Please select destination folder to save downloaded CAB packages.");
+                if (string.IsNullOrWhiteSpace(exportFolder))
+                {
+                    if (!PushPackages.showRetryQuestion("Destination folder is not valid!, retry?", "Skip", ConsoleColor.Red))
+                    {
+                        return;
+                    }
+                    continue;
+                }
+
+                try
+                {
+                    WriteLine($"\nExporting CAB packages to:\n{exportFolder}", ConsoleColor.Blue);
+                    int exportedCount = DownloadPackages.ExportPackagesToFolder(sourcePackagesDir, exportFolder);
+                    if (exportedCount > 0)
+                    {
+                        WriteLine($"\nSaved {exportedCount} CAB package(s) to:\n{exportFolder}", ConsoleColor.Green);
+                    }
+                    else
+                    {
+                        WriteLine("\nNo CAB packages found to export.", ConsoleColor.DarkYellow);
+                    }
+                    return;
+                }
+                catch (Exception ex)
+                {
+                    appendLog($"[EXPORT PACKAGES] Error: {ex}\n");
+                    WriteLine($"\nFailed to export CAB packages: {ex.Message}", ConsoleColor.Red);
+                    if (!PushPackages.showRetryQuestion("Retry exporting CAB packages to another folder?", "Skip", ConsoleColor.DarkYellow))
+                    {
+                        return;
+                    }
+                }
+            }
+        }
+
         static async Task HandleDownloadCabsMode()
         {
             useConnectedDevice = false;
@@ -1047,6 +1108,10 @@ namespace Universal_Updater
 
                     ConsoleStyle("\nDOWNLOADING PACKAGES", 1, ConsoleColor.DarkGray);
                     packagesReady = await DownloadPackages.DownloadUpdate(targetBuild);
+                    if (packagesReady)
+                    {
+                        await PromptExportDownloadedPackagesAsync(DownloadPackages.GetDefaultPackagesDir());
+                    }
                 }
 
                 string messageBoxText = "";
@@ -1130,6 +1195,7 @@ namespace Universal_Updater
 
         static Task printLogLocation()
         {
+            WPinternalsHelper.DrainConsoleInputBuffer();
             var previewLogFile = logFile.Replace($@"{Environment.CurrentDirectory}\", "");
             WriteLine($"\nFinished.\n\nFor more details check the logs\n{previewLogFile}\n", ConsoleColor.DarkGray);
 
