@@ -40,6 +40,7 @@
     <Compile Include="FolderPicker.cs" />
     <Compile Include="GetDeviceInfo.cs" />
     <Compile Include="OutputCapture.cs" />
+    <Compile Include="PaperSpkgConverter.cs" />
     <Compile Include="Program.cs" />
     <Compile Include="Properties\AssemblyInfo.cs" />
     <Compile Include="PushPackages.cs" />
