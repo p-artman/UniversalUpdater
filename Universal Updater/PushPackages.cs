@@ -508,6 +508,7 @@ namespace Universal_Updater
             {
                 Program.WriteLine($"\nFFU should be saved to:\n{outputFFU}", ConsoleColor.Blue);
                 Program.printFlashInstructions();
+                await WPinternalsHelper.PromptAndDumpPartitionsAsync(outputFFU);
             }
             return true;
         }

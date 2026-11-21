@@ -77,12 +77,16 @@ namespace Universal_Updater
             return taskCompletionSource.Task;
         }
 
-        public static Task<string> ShowOpenFileDialogAsync(string fileExt)
+        public static Task<string> ShowOpenFileDialogAsync(
+            string fileExt,
+            string promptMessage = null,
+            string customFilter = null,
+            string customTitle = null)
         {
             var capsPreview = fileExt.ToUpper();
             MessageBox.Show(
-            $"Please select the ({capsPreview}) file.",
-            $"Open {capsPreview}",
+            string.IsNullOrEmpty(promptMessage) ? $"Please select the ({capsPreview}) file." : promptMessage,
+            string.IsNullOrEmpty(customTitle) ? $"Open {capsPreview}" : customTitle,
             MessageBoxButtons.OK,
             MessageBoxIcon.Information);
             var taskCompletionSource = new TaskCompletionSource<string>();
@@ -92,8 +96,8 @@ namespace Universal_Updater
             {
                 using (var openFileDialog = new OpenFileDialog())
                 {
-                    openFileDialog.Title = $"Open {capsPreview} File";
-                    openFileDialog.Filter = $"{capsPreview} Files (*.{fileExt})|*.{fileExt}";
+                    openFileDialog.Title = string.IsNullOrEmpty(customTitle) ? $"Open {capsPreview} File" : customTitle;
+                    openFileDialog.Filter = string.IsNullOrEmpty(customFilter) ? $"{capsPreview} Files (*.{fileExt})|*.{fileExt}" : customFilter;
                     openFileDialog.DefaultExt = $"{fileExt}";
                     openFileDialog.AddExtension = true;
 
